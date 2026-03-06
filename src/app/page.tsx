@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { supabase } from '@/lib/supabase'
 
 interface FileAttachment {
   name: string
@@ -162,6 +163,7 @@ export default function Home() {
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null)
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [isLoadingConvos, setIsLoadingConvos] = useState(true)
   const [showSettings, setShowSettings] = useState(false)
   const [showSidebar, setShowSidebar] = useState(true)
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT)
@@ -179,15 +181,41 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const isMobile = useIsMobile()
 
+  // Load conversations from Supabase on mount
   useEffect(() => {
-    const savedConvos = localStorage.getItem('claude-conversations')
-    if (savedConvos) {
-      const parsed = JSON.parse(savedConvos)
-      setConversations(parsed)
-      if (parsed.length > 0) {
-        setActiveConvoId(parsed[0].id)
+    async function loadConversations() {
+      try {
+        const { data, error } = await supabase
+          .from('conversations')
+          .select('*')
+          .order('updated_at', { ascending: false })
+
+        if (error) {
+          console.error('Supabase load error:', error)
+          return
+        }
+
+        if (data && data.length > 0) {
+          const convos: Conversation[] = data.map(row => ({
+            id: row.id,
+            title: row.title,
+            messages: row.messages as Message[],
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+          }))
+          setConversations(convos)
+          setActiveConvoId(convos[0].id)
+        }
+      } catch (err) {
+        console.error('Failed to load conversations:', err)
+      } finally {
+        setIsLoadingConvos(false)
       }
     }
+
+    loadConversations()
+
+    // Load local preferences (these stay in localStorage — they're device-specific)
     const savedSysPrompt = localStorage.getItem('claude-system-prompt')
     if (savedSysPrompt) {
       setSystemPrompt(savedSysPrompt)
@@ -197,7 +225,6 @@ export default function Home() {
     if (savedModel) {
       setSelectedModel(savedModel)
     }
-    // Start with sidebar closed on mobile
     if (window.innerWidth < 768) {
       setShowSidebar(false)
     }
@@ -221,23 +248,40 @@ export default function Home() {
     }
   }, [input])
 
-  const saveConversations = useCallback((convos: Conversation[]) => {
+  // Save a single conversation to Supabase
+  const saveConversation = useCallback(async (convo: Conversation) => {
     try {
-      localStorage.setItem('claude-conversations', JSON.stringify(convos))
-    } catch (e) {
-      console.error('localStorage save error:', e)
-      const stripped = convos.map(c => ({
-        ...c,
-        messages: c.messages.map(m => ({
-          ...m,
-          attachments: m.attachments?.map(a => a.isImage ? { ...a, content: '[image data cleared to save space]' } : a),
-        })),
-      }))
-      try {
-        localStorage.setItem('claude-conversations', JSON.stringify(stripped))
-      } catch {
-        console.error('localStorage critically full')
+      const { error } = await supabase
+        .from('conversations')
+        .upsert({
+          id: convo.id,
+          title: convo.title,
+          messages: convo.messages,
+          created_at: convo.createdAt,
+          updated_at: convo.updatedAt,
+        })
+
+      if (error) {
+        console.error('Supabase save error:', error)
       }
+    } catch (err) {
+      console.error('Failed to save conversation:', err)
+    }
+  }, [])
+
+  // Delete a conversation from Supabase
+  const removeConversation = useCallback(async (id: string) => {
+    try {
+      const { error } = await supabase
+        .from('conversations')
+        .delete()
+        .eq('id', id)
+
+      if (error) {
+        console.error('Supabase delete error:', error)
+      }
+    } catch (err) {
+      console.error('Failed to delete conversation:', err)
     }
   }, [])
 
@@ -301,12 +345,12 @@ export default function Home() {
 
   const toggleSidebar = () => {
     setShowSidebar(!showSidebar)
-    if (!showSidebar) setShowSettings(false) // close settings when opening sidebar
+    if (!showSidebar) setShowSettings(false)
   }
 
   const toggleSettings = () => {
     setShowSettings(!showSettings)
-    if (!showSettings) setShowSidebar(isMobile ? false : showSidebar) // on mobile, close sidebar when opening settings
+    if (!showSettings) setShowSidebar(isMobile ? false : showSidebar)
   }
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -377,7 +421,7 @@ export default function Home() {
     const updated = [newConvo, ...conversations]
     setConversations(updated)
     setActiveConvoId(newConvo.id)
-    saveConversations(updated)
+    saveConversation(newConvo)
     if (isMobile) setShowSidebar(false)
   }
 
@@ -385,7 +429,7 @@ export default function Home() {
     e.stopPropagation()
     const updated = conversations.filter(c => c.id !== id)
     setConversations(updated)
-    saveConversations(updated)
+    removeConversation(id)
     if (activeConvoId === id) {
       setActiveConvoId(updated.length > 0 ? updated[0].id : null)
     }
@@ -443,7 +487,8 @@ export default function Home() {
     })
 
     setConversations(updatedConversations)
-    saveConversations(updatedConversations)
+    const convoToSave = updatedConversations.find(c => c.id === currentConvoId)
+    if (convoToSave) saveConversation(convoToSave)
 
     try {
       const currentConvo = updatedConversations.find(c => c.id === currentConvoId)
@@ -483,7 +528,8 @@ export default function Home() {
       })
 
       setConversations(finalConversations)
-      saveConversations(finalConversations)
+      const finalConvo = finalConversations.find(c => c.id === currentConvoId)
+      if (finalConvo) saveConversation(finalConvo)
     } catch (error) {
       console.error('Error:', error)
       const errorMessage: Message = {
@@ -497,7 +543,8 @@ export default function Home() {
         return c
       })
       setConversations(errorConversations)
-      saveConversations(errorConversations)
+      const errorConvo = errorConversations.find(c => c.id === currentConvoId)
+      if (errorConvo) saveConversation(errorConvo)
     } finally {
       setIsLoading(false)
     }
@@ -614,38 +661,43 @@ export default function Home() {
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {filteredConversations.length === 0 && (
+        {isLoadingConvos ? (
+          <div className="p-4 text-center text-gray-600 text-sm">
+            Loading conversations...
+          </div>
+        ) : filteredConversations.length === 0 ? (
           <div className="p-4 text-center text-gray-600 text-sm">
             {searchQuery ? 'No conversations found' : 'No conversations yet — start one!'}
           </div>
-        )}
-        {filteredConversations.map(convo => (
-          <div
-            key={convo.id}
-            onClick={() => selectConversation(convo.id)}
-            className={`group px-3 py-3 cursor-pointer border-b border-gray-800/50 hover:bg-gray-800/50 transition-colors ${
-              activeConvoId === convo.id ? 'bg-gray-800/70 border-l-2 border-l-purple-500' : ''
-            }`}
-          >
-            <div className="flex items-start justify-between gap-2">
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-gray-200 truncate">
-                  {convo.title}
-                </p>
-                <p className="text-xs text-gray-500 mt-1">
-                  {formatDate(convo.updatedAt)} · {convo.messages.length} messages
-                </p>
+        ) : (
+          filteredConversations.map(convo => (
+            <div
+              key={convo.id}
+              onClick={() => selectConversation(convo.id)}
+              className={`group px-3 py-3 cursor-pointer border-b border-gray-800/50 hover:bg-gray-800/50 transition-colors ${
+                activeConvoId === convo.id ? 'bg-gray-800/70 border-l-2 border-l-purple-500' : ''
+              }`}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-gray-200 truncate">
+                    {convo.title}
+                  </p>
+                  <p className="text-xs text-gray-500 mt-1">
+                    {formatDate(convo.updatedAt)} · {convo.messages.length} messages
+                  </p>
+                </div>
+                <button
+                  onClick={(e) => deleteConversation(convo.id, e)}
+                  className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 text-xs transition-opacity p-1"
+                  title="Delete conversation"
+                >
+                  ✕
+                </button>
               </div>
-              <button
-                onClick={(e) => deleteConversation(convo.id, e)}
-                className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 text-xs transition-opacity p-1"
-                title="Delete conversation"
-              >
-                ✕
-              </button>
             </div>
-          </div>
-        ))}
+          ))
+        )}
       </div>
 
       <div className="border-t border-gray-800 p-3">
